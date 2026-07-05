@@ -1,6 +1,9 @@
 node_modules/
 dist/
 
+# harness-work worker worktrees (created/removed by the harness-work skill loop)
+.harness-worktrees/
+
 # harness working-state directories (created by task 1.6+)
 .harness/state/
 .harness/escalations/
