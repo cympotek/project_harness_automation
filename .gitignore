@@ -1,0 +1,18 @@
+node_modules/
+dist/
+
+# harness working-state directories (created by task 1.6+)
+.harness/state/
+.harness/escalations/
+.harness/
+
+# OS & editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/settings.json
+
+# env
+.env
+.env.local
