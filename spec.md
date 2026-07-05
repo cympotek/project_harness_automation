@@ -144,6 +144,12 @@ file or fed back into a repair prompt.
 3. Whether escalation should ever push beyond console+file (e.g. Slack/PushNotification) —
    deferred until there's evidence the console+file combo is insufficient for the solo-dev
    MVP user.
+4. Whether `TaskInput.verifyCommands` should be required to be non-empty. Currently
+   `validateTaskInput` (Core schema) only checks it is a string array; an empty list makes
+   the loop controller's sensor run vacuously "pass" (`Array.prototype.every` on `[]` is
+   `true`) after a single agent attempt with zero real verification. Discovered during task
+   1.5 review — not fixed yet since it means touching the already-shipped schema validator;
+   tracked here rather than silently left as an implicit assumption.
 
 ## Links
 
