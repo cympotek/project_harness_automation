@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { EscalationArtifact, StateFile } from "./schema.js";
 import {
   escalationFilePath,
+  readStateFile,
   stateFilePath,
   writeEscalationFile,
   writeStateFile,
@@ -209,5 +210,98 @@ describe("writeEscalationFile", () => {
     const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as EscalationArtifact;
     expect(parsed).toEqual(artifact);
     expect(parsed.attemptHistory).toHaveLength(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// readStateFile (Task 1.7)
+// ---------------------------------------------------------------------------
+
+describe("readStateFile", () => {
+  it("returns null when the state file does not exist", () => {
+    const result = readStateFile("no-such-task", tmpDir);
+    expect(result).toBeNull();
+  });
+
+  it("returns the parsed StateFile for an existing file", () => {
+    const state: StateFile = {
+      taskId: "read-task",
+      attemptCount: 2,
+      status: "running",
+      lastSensorOutput: "tests failed",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:02:00.000Z",
+    };
+    writeStateFile(state, tmpDir);
+
+    const result = readStateFile("read-task", tmpDir);
+    expect(result).toEqual(state);
+  });
+
+  it("returns null (not throw) when the file contains corrupt JSON", () => {
+    const dir = path.join(tmpDir, "state");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "corrupt-task.json"), "{ not valid json >>>", "utf8");
+
+    let result: StateFile | null | undefined = undefined;
+    expect(() => {
+      result = readStateFile("corrupt-task", tmpDir);
+    }).not.toThrow();
+    expect(result).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// writeStateFile — createdAt preservation (Task 1.7)
+// ---------------------------------------------------------------------------
+
+describe("writeStateFile — createdAt preservation", () => {
+  it("preserves createdAt from first write on subsequent writes to same taskId", () => {
+    const stateV1: StateFile = {
+      taskId: "preserve-task",
+      attemptCount: 1,
+      status: "running",
+      lastSensorOutput: "attempt 1 failed",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:01:00.000Z",
+    };
+    // V2 has a DIFFERENT createdAt — writeStateFile must ignore it and preserve V1's
+    const stateV2: StateFile = {
+      taskId: "preserve-task",
+      attemptCount: 2,
+      status: "passed",
+      lastSensorOutput: "all checks passed",
+      createdAt: "2026-12-31T23:59:59.000Z",
+      updatedAt: "2026-01-01T00:02:00.000Z",
+    };
+
+    writeStateFile(stateV1, tmpDir);
+    writeStateFile(stateV2, tmpDir);
+
+    const filePath = path.join(tmpDir, "state", "preserve-task.json");
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as StateFile;
+
+    // createdAt is preserved from V1, NOT stateV2's different value
+    expect(parsed.createdAt).toBe("2026-01-01T00:00:00.000Z");
+    // updatedAt comes from V2
+    expect(parsed.updatedAt).toBe("2026-01-01T00:02:00.000Z");
+    // Other V2 fields
+    expect(parsed.attemptCount).toBe(2);
+    expect(parsed.status).toBe("passed");
+  });
+
+  it("uses the passed createdAt when no prior file exists (fresh first write)", () => {
+    const state: StateFile = {
+      taskId: "fresh-task",
+      attemptCount: 1,
+      status: "running",
+      lastSensorOutput: "",
+      createdAt: "2026-06-15T12:00:00.000Z",
+      updatedAt: "2026-06-15T12:00:00.000Z",
+    };
+    writeStateFile(state, tmpDir);
+
+    const result = readStateFile("fresh-task", tmpDir);
+    expect(result?.createdAt).toBe("2026-06-15T12:00:00.000Z");
   });
 });

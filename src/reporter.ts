@@ -1,60 +1,70 @@
 /**
- * Reporter module (Task 1.6).
+ * Reporter module (Task 1.6, extended in Task 1.7).
  *
  * Orchestrates the reporting and persistence wrapper around runLoop.
  * This module is responsible for "what to persist/print" — the retry logic
  * itself lives in loop-controller.ts.
  *
- * On `status: "passed"`:
- *   - Writes a StateFile with `status: "passed"` and `attemptCount` = number
- *     of attempts taken.
- *   - `lastSensorOutput`: the last attempt's sensor output joined as a string,
- *     or "all checks passed" if the last attempt had no sensor failures.
- *   - Prints EXACTLY ONE console.log line (Core Rule 10: small declarative
- *     status lines). No per-attempt lines from this function.
+ * Task 1.7 resume behaviour:
+ *   Before calling runLoop, reads any existing state file for the task.
+ *   - If `status: "passed"` is found, the task already completed (process crashed
+ *     after onAttempt wrote the passing state). Short-circuit: skip runLoop and
+ *     return {status:"passed",attempts:[]} immediately.
+ *   - If `status: "running"` is found, computes `startAttempt = priorState.attemptCount + 1`
+ *     and seeds the first resumed attempt's repair prompt from priorState.lastSensorOutput.
+ *   - Otherwise (no prior state, or prior status "escalated"), starts fresh at attempt 1.
  *
- * On `status: "escalated"`:
- *   - Builds an EscalationArtifact from loopResult.attempts:
- *       - attemptHistory entries map each attempt's sensorResult to a string
- *         via JSON.stringify (consistent serialization; documents the full
- *         SensorRunResult shape for human inspection).
- *       - timestamp is the injected `now()` value for all entries (deterministic
- *         in tests; real wall-clock in production).
- *   - Writes the EscalationArtifact via writeEscalationFile.
- *   - ALSO writes a StateFile with `status: "escalated"`.
- *   - Prints ONE console.error escalation message (dual-channel per Core Rule 3).
+ *   An `onAttempt` callback (injected into runLoop) writes state after every attempt:
+ *     - `status: "passed"` if the attempt's sensor allPassed === true (closes the
+ *       crash-after-final-attempt window — the file accurately reflects a pass the
+ *       instant it happens).
+ *     - `status: "running"` otherwise (mid-loop crash recovery marker).
  *
- * Returns the original LoopResult unchanged (reporter is a wrapper, not a
- * replacement for the loop result).
+ * On final `status: "passed"` (loop returns normally):
+ *   - Writes a StateFile with `status: "passed"` (final authoritative write).
+ *   - `attemptCount` = actual attempt number of the last attempt (correct across resumes).
+ *   - Prints EXACTLY ONE console.log line (Core Rule 10).
+ *
+ * On final `status: "escalated"`:
+ *   - Builds an EscalationArtifact. When this is a resumed run (startAttempt > 1),
+ *     prepends a synthetic marker entry so readers know the history is partial.
+ *   - Writes the EscalationArtifact and a StateFile (status: escalated).
+ *   - Prints ONE console.error message (Core Rule 3 dual-channel).
+ *
+ * Returns the original LoopResult unchanged (or a synthetic {status:"passed",attempts:[]}
+ * for the already-completed short-circuit path).
  *
  * Injectable opts for testability:
- *   - `runLoopFn`: fake loop that returns a pre-baked LoopResult.
- *   - `harnessDir`: points tests at a temp dir, never the real .harness/.
- *   - `now`: returns a fixed ISO timestamp so tests don't depend on wall-clock.
+ *   - `runLoopFn`: fake loop that returns a pre-baked LoopResult (backward compat).
+ *   - `runAgentAttemptFn` / `runSensorsFn`: injected into the real runLoop.
+ *   - `harnessDir`: points tests at a temp dir.
+ *   - `now`: returns a fixed ISO timestamp for deterministic tests.
  */
 
-import type { LoopResult } from "./loop-controller.js";
+import type { LoopAttemptRecord, LoopResult, RunAgentAttemptFn, RunSensorsFn } from "./loop-controller.js";
 import { runLoop } from "./loop-controller.js";
 import type { EscalationArtifact, StateFile, TaskInput } from "./schema.js";
-import { writeEscalationFile, writeStateFile } from "./state-store.js";
+import { readStateFile, writeEscalationFile, writeStateFile } from "./state-store.js";
 
 // ---------------------------------------------------------------------------
-// Injectable runLoop type alias
+// Injectable runLoop type alias (extended for Task 1.7 opts)
 // ---------------------------------------------------------------------------
 
-type RunLoopFn = (task: TaskInput) => Promise<LoopResult>;
+type RunLoopFn = (
+  task: TaskInput,
+  opts?: {
+    startAttempt?: number;
+    onAttempt?: (record: LoopAttemptRecord) => void;
+    initialRepairPrompt?: string;
+    runAgentAttemptFn?: RunAgentAttemptFn;
+    runSensorsFn?: RunSensorsFn;
+  },
+) => Promise<LoopResult>;
 
 // ---------------------------------------------------------------------------
-// Helper: summarize sensor result to string
+// Helper: serialise sensor result for EscalationArtifact
 // ---------------------------------------------------------------------------
 
-/**
- * Serializes a SensorRunResult (or undefined) to a string for use in
- * EscalationArtifact.attemptHistory[].sensorResult (which is typed as string).
- *
- * Uses JSON.stringify for consistency — provides the full shape for inspection.
- * Falls back to "no sensor result" when sensorResult is absent (agent timed out).
- */
 function serializeSensorResult(
   sensorResult: LoopResult["attempts"][number]["sensorResult"],
 ): string {
@@ -65,18 +75,16 @@ function serializeSensorResult(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: extract last sensor output string for StateFile.lastSensorOutput
+// Helper: extract last sensor output string from a LoopResult
 // ---------------------------------------------------------------------------
 
 function extractLastSensorOutput(result: LoopResult): string {
-  // Walk attempts from last to first to find the last one with a sensor result.
   for (let i = result.attempts.length - 1; i >= 0; i--) {
     const attempt = result.attempts[i];
     if (attempt?.sensorResult !== undefined) {
       if (attempt.sensorResult.allPassed) {
         return "all checks passed";
       }
-      // Collect failing command outputs.
       const failingOutputs = attempt.sensorResult.results
         .filter((r) => !r.passed)
         .map((r) => `[${r.command}]: ${r.output}`)
@@ -88,11 +96,30 @@ function extractLastSensorOutput(result: LoopResult): string {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: extract sensor output from a single attempt record (for onAttempt)
+// ---------------------------------------------------------------------------
+
+function extractSensorOutputFromRecord(record: LoopAttemptRecord): string {
+  if (record.sensorResult === undefined) {
+    return "no sensor result (agent attempt failed or timed out)";
+  }
+  if (record.sensorResult.allPassed) {
+    return "all checks passed";
+  }
+  const failingOutputs = record.sensorResult.results
+    .filter((r) => !r.passed)
+    .map((r) => `[${r.command}]: ${r.output}`)
+    .join("\n");
+  return failingOutputs || "sensor run failed (no output captured)";
+}
+
+// ---------------------------------------------------------------------------
 // Main export
 // ---------------------------------------------------------------------------
 
 /**
- * Calls runLoop (or the injected fake) and handles persistence/reporting.
+ * Resume-aware entry point: reads prior state, runs the loop (from the right
+ * attempt), persists state after every attempt, and writes the final artifact.
  *
  * @param task    Validated TaskInput.
  * @param opts    Injectable dependencies for testability.
@@ -101,48 +128,128 @@ function extractLastSensorOutput(result: LoopResult): string {
 export async function runTaskToCompletion(
   task: TaskInput,
   opts?: {
-    /** Fake loop function for tests. Defaults to the real runLoop. */
+    /** Fake loop function for tests. When provided, runAgentAttemptFn/runSensorsFn are ignored. */
     runLoopFn?: RunLoopFn;
+    /** Injected agent runner — passed through to the real runLoop when runLoopFn is absent. */
+    runAgentAttemptFn?: RunAgentAttemptFn;
+    /** Injected sensor runner — passed through to the real runLoop when runLoopFn is absent. */
+    runSensorsFn?: RunSensorsFn;
     /** Base harness directory. Defaults to .harness relative to cwd. */
     harnessDir?: string;
     /** Timestamp factory. Defaults to () => new Date().toISOString(). */
     now?: () => string;
   },
 ): Promise<LoopResult> {
-  const loopFn = opts?.runLoopFn ?? runLoop;
+  const loopFn: RunLoopFn = opts?.runLoopFn ?? runLoop;
   const harnessDir = opts?.harnessDir;
   const now = opts?.now ?? (() => new Date().toISOString());
 
-  const loopResult = await loopFn(task);
+  // (a) Resume: read any persisted state for this task.
+  const priorState = readStateFile(task.taskId, harnessDir);
+
+  // Fix 1b: if prior state is already "passed" (process crashed after the final
+  // attempt's onAttempt wrote the passing state, before runLoop returned), short-
+  // circuit without calling the agent or sensors again.
+  if (priorState?.status === "passed") {
+    console.log(
+      `✓ task ${task.taskId} done — already completed (resumed from prior state: passed)`,
+    );
+    return { status: "passed", attempts: [] };
+  }
+
+  const startAttempt =
+    priorState?.status === "running" ? priorState.attemptCount + 1 : 1;
+
+  // (b) Mid-loop persistence (Core Rule 5): write state after every attempt.
+  //     Fix 1a: write status:"passed" when allPassed===true (not always "running").
+  //     This closes the crash window between onAttempt and runLoop returning.
+  const onAttempt = (record: LoopAttemptRecord): void => {
+    const ts = now();
+    // Accurately reflect the attempt outcome in the persisted status:
+    //   passed  → onAttempt fires before runLoop returns; a crash here must not
+    //             report a passed task as "running" on resume.
+    //   running → normal mid-loop checkpoint; crash here triggers startAttempt+1.
+    const midStatus: StateFile["status"] =
+      record.sensorResult?.allPassed === true ? "passed" : "running";
+    const midState: StateFile = {
+      taskId: task.taskId,
+      attemptCount: record.attempt,
+      status: midStatus,
+      lastSensorOutput: extractSensorOutputFromRecord(record),
+      createdAt: ts,   // writeStateFile preserves existing createdAt automatically
+      updatedAt: ts,
+    };
+    writeStateFile(midState, harnessDir);
+  };
+
+  // (c) Run the loop (real or fake) with resume + persistence hooks.
+  //     Fix 2: seed the first resumed attempt's repair prompt from prior state.
+  //     Omit optional fields that are undefined under exactOptionalPropertyTypes.
+  const loopResult = await loopFn(task, {
+    startAttempt,
+    onAttempt,
+    ...(startAttempt > 1 && priorState?.lastSensorOutput !== undefined
+      ? { initialRepairPrompt: priorState.lastSensorOutput }
+      : {}),
+    ...(opts?.runAgentAttemptFn !== undefined
+      ? { runAgentAttemptFn: opts.runAgentAttemptFn }
+      : {}),
+    ...(opts?.runSensorsFn !== undefined
+      ? { runSensorsFn: opts.runSensorsFn }
+      : {}),
+  });
+
   const timestamp = now();
 
+  // (d) Determine the actual total attempt count (last attempt's number, not array length).
+  //     When resuming, attempts in this run start at N+1, so .length underestimates total.
+  const lastRecord = loopResult.attempts[loopResult.attempts.length - 1];
+  const totalAttemptCount = lastRecord?.attempt ?? startAttempt - 1;
+
   if (loopResult.status === "passed") {
-    // --- Persist state file ---
     const state: StateFile = {
       taskId: task.taskId,
-      attemptCount: loopResult.attempts.length,
+      attemptCount: totalAttemptCount,
       status: "passed",
       lastSensorOutput: extractLastSensorOutput(loopResult),
-      createdAt: timestamp,
+      createdAt: timestamp,   // writeStateFile preserves prior createdAt if file exists
       updatedAt: timestamp,
     };
     writeStateFile(state, harnessDir);
 
-    // --- Print EXACTLY ONE done line (Core Rule 10 / DoD item a) ---
     console.log(
-      `✓ task ${task.taskId} done — passed after ${loopResult.attempts.length} attempt(s)`,
+      `✓ task ${task.taskId} done — passed after ${totalAttemptCount} attempt(s)`,
     );
   } else {
     // status === "escalated"
     const maxAttempts = task.maxAttempts ?? 3;
 
-    // --- Build EscalationArtifact ---
-    const attemptHistory: EscalationArtifact["attemptHistory"] =
+    // Fix 3: when resuming (startAttempt > 1), prepend a synthetic marker entry so
+    // that a human reading the escalation artifact knows the history is partial and
+    // why — not silently seeing a history that starts at attempt 2 with no explanation.
+    const resumeMarker: EscalationArtifact["attemptHistory"][number] | null =
+      startAttempt > 1
+        ? {
+            attempt: 0,
+            sensorResult:
+              `[resumed run] attempts 1..${startAttempt - 1} occurred in a prior` +
+              ` process invocation before a crash/restart; last known sensor output:` +
+              ` ${priorState?.lastSensorOutput ?? "unknown"}`,
+            timestamp: priorState?.updatedAt ?? timestamp,
+          }
+        : null;
+
+    const currentAttemptHistory: EscalationArtifact["attemptHistory"] =
       loopResult.attempts.map((rec) => ({
         attempt: rec.attempt,
         sensorResult: serializeSensorResult(rec.sensorResult),
         timestamp,
       }));
+
+    const attemptHistory: EscalationArtifact["attemptHistory"] =
+      resumeMarker !== null
+        ? [resumeMarker, ...currentAttemptHistory]
+        : currentAttemptHistory;
 
     const artifact: EscalationArtifact = {
       taskId: task.taskId,
@@ -151,13 +258,11 @@ export async function runTaskToCompletion(
       reason: "max attempts exceeded",
     };
 
-    // --- Write escalation file (Core Rule 3: dual-channel) ---
     writeEscalationFile(artifact, harnessDir);
 
-    // --- ALSO write state file with status: escalated (Core Rule 5) ---
     const state: StateFile = {
       taskId: task.taskId,
-      attemptCount: loopResult.attempts.length,
+      attemptCount: totalAttemptCount,
       status: "escalated",
       lastSensorOutput: extractLastSensorOutput(loopResult),
       createdAt: timestamp,
@@ -165,7 +270,6 @@ export async function runTaskToCompletion(
     };
     writeStateFile(state, harnessDir);
 
-    // --- Print escalation message to console.error (Core Rule 3 / DoD item b) ---
     console.error(
       `✗ task ${task.taskId} escalated — exceeded ${maxAttempts} attempt(s) without passing sensors`,
     );

@@ -346,3 +346,131 @@ describe("runLoop — repair prompt is verbatim sensor failure output", () => {
     expect(repairPrompt).toContain("npm run test");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Task 1.7: startAttempt — loop begins at an arbitrary attempt number
+// ---------------------------------------------------------------------------
+
+describe("runLoop — startAttempt param (Task 1.7)", () => {
+  it("with startAttempt=3 and maxAttempts=3 runs exactly ONE iteration (attempt 3)", async () => {
+    const fakeAgent = vi.fn(() => Promise.resolve(makeAgentResult()));
+    const fakeSensor = vi.fn(() => Promise.resolve(makePassedSensorResult()));
+
+    const result = await runLoop(BASE_TASK, {
+      runAgentAttemptFn: fakeAgent,
+      runSensorsFn: fakeSensor,
+      startAttempt: 3,
+    });
+
+    // Only one attempt (attempt 3) was executed
+    expect(fakeAgent).toHaveBeenCalledTimes(1);
+    expect(fakeSensor).toHaveBeenCalledTimes(1);
+    expect(result.attempts).toHaveLength(1);
+    expect(result.attempts[0]!.attempt).toBe(3);
+    expect(result.status).toBe("passed");
+  });
+
+  it("without startAttempt defaults to 1 (backward compatible)", async () => {
+    const fakeAgent = vi.fn(() => Promise.resolve(makeAgentResult()));
+    const fakeSensor = vi.fn(() => Promise.resolve(makePassedSensorResult()));
+
+    const result = await runLoop(BASE_TASK, {
+      runAgentAttemptFn: fakeAgent,
+      runSensorsFn: fakeSensor,
+    });
+
+    expect(fakeAgent).toHaveBeenCalledTimes(1);
+    expect(result.attempts[0]!.attempt).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 1.7: onAttempt callback — invoked after every attempt
+// ---------------------------------------------------------------------------
+
+describe("runLoop — onAttempt callback (Task 1.7)", () => {
+  it("invokes onAttempt once per attempt with the correct record, in order", async () => {
+    const agentResults = [
+      makeAgentResult({ output: "attempt 1 done" }),
+      makeAgentResult({ output: "attempt 2 done" }),
+    ];
+    let agentIdx = 0;
+    const fakeAgent = vi.fn(() => Promise.resolve(agentResults[agentIdx++]!));
+
+    const sensorResults = [
+      makeFailedSensorResult("fail on 1"),
+      makePassedSensorResult(),
+    ];
+    let sensorIdx = 0;
+    const fakeSensor = vi.fn(() => Promise.resolve(sensorResults[sensorIdx++]!));
+
+    const capturedRecords: Array<{ attempt: number; passed: boolean | undefined }> = [];
+    const onAttempt = vi.fn((record: { attempt: number; sensorResult?: { allPassed: boolean } }) => {
+      capturedRecords.push({
+        attempt: record.attempt,
+        passed: record.sensorResult?.allPassed,
+      });
+    });
+
+    const result = await runLoop(BASE_TASK, {
+      runAgentAttemptFn: fakeAgent,
+      runSensorsFn: fakeSensor,
+      onAttempt,
+    });
+
+    // Called exactly twice (one per attempt)
+    expect(onAttempt).toHaveBeenCalledTimes(2);
+
+    // First callback: attempt 1, sensor failed
+    expect(capturedRecords[0]!.attempt).toBe(1);
+    expect(capturedRecords[0]!.passed).toBe(false);
+
+    // Second callback: attempt 2, sensor passed
+    expect(capturedRecords[1]!.attempt).toBe(2);
+    expect(capturedRecords[1]!.passed).toBe(true);
+
+    expect(result.status).toBe("passed");
+  });
+
+  it("with initialRepairPrompt set, first attempt receives it as repairPrompt", async () => {
+    const capturedPrompts: Array<string | undefined> = [];
+    const fakeAgent = vi.fn((_task: TaskInput, opts?: { repairPrompt?: string }) => {
+      capturedPrompts.push(opts?.repairPrompt);
+      return Promise.resolve(makeAgentResult());
+    });
+    const fakeSensor = vi.fn(() => Promise.resolve(makePassedSensorResult()));
+
+    await runLoop(BASE_TASK, {
+      runAgentAttemptFn: fakeAgent,
+      runSensorsFn: fakeSensor,
+      initialRepairPrompt: "pre-crash sensor failure: 3 tests failed",
+    });
+
+    // Fix 2: first attempt must receive initialRepairPrompt as its repairPrompt
+    expect(capturedPrompts[0]).toBe("pre-crash sensor failure: 3 tests failed");
+  });
+
+  it("invokes onAttempt even when agent attempt fails (ok=false)", async () => {
+    const agentResults = [
+      makeAgentResult({ ok: false, timedOut: true, output: "", error: "timed out" }),
+      makeAgentResult({ output: "recovered" }),
+    ];
+    let agentIdx = 0;
+    const fakeAgent = vi.fn(() => Promise.resolve(agentResults[agentIdx++]!));
+    const fakeSensor = vi.fn(() => Promise.resolve(makePassedSensorResult()));
+
+    const onAttempt = vi.fn();
+
+    await runLoop(BASE_TASK, {
+      runAgentAttemptFn: fakeAgent,
+      runSensorsFn: fakeSensor,
+      onAttempt,
+    });
+
+    // Called twice (once for failed agent, once for successful attempt)
+    expect(onAttempt).toHaveBeenCalledTimes(2);
+    // First call's record has no sensorResult (agent failed)
+    const firstRecord = onAttempt.mock.calls[0]![0] as { sensorResult?: unknown };
+    expect(firstRecord.sensorResult).toBeUndefined();
+  });
+});
