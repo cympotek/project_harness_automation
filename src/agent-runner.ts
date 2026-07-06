@@ -46,6 +46,8 @@
  *   mechanism (vs. just abandoning the promise).
  */
 
+import fs from "node:fs";
+import path from "node:path";
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { TaskInput } from "./schema.js";
@@ -117,6 +119,114 @@ export interface AgentAttemptResult {
 }
 
 // ---------------------------------------------------------------------------
+// TEST-ONLY fake agent (activated by HARNESS_FAKE_AGENT env var)
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates a deterministic fake `QueryFn` for use in end-to-end tests.
+ *
+ * IMPORTANT — TEST-ONLY ESCAPE HATCH:
+ *   This function is ONLY used when the `HARNESS_FAKE_AGENT` environment
+ *   variable is set in the process environment AND no explicit `opts.queryFn`
+ *   was passed to `runAgentAttempt`. It is NEVER intended for production
+ *   task-solving and has NO effect on any real Anthropic API call.
+ *
+ *   Omitting `HARNESS_FAKE_AGENT` (the default in production and in all
+ *   existing unit tests that pass their own `queryFn`) leaves this module's
+ *   behaviour entirely unchanged — the real SDK `query()` is used exactly as
+ *   before. This preserves full backward compatibility with tasks 1.3/1.5's
+ *   tests and real production usage.
+ *
+ * Behaviour — two-attempt sequence (exercises the full retry + repair-prompt
+ * feedback path mandated by task 1.8's DoD):
+ *
+ *   Attempt 1 (no repair context in the combined prompt):
+ *     Writes the WRONG value "0" to `answer.txt` inside `params.options.cwd`.
+ *     The fixture's `check.js` sensor will still fail (expected "42", got "0"),
+ *     so the loop controller builds a repair prompt and runs attempt 2.
+ *
+ *   Attempt 2+ (repair context detected — the combined prompt contains the
+ *     literal string "The following verification commands failed", which is the
+ *     prefix `buildRepairPrompt` in loop-controller.ts always uses):
+ *     Writes the CORRECT value "42" to `answer.txt`.
+ *     The fixture's `check.js` sensor now passes for real (exits 0).
+ *
+ * Why this satisfies Core Rule 1 (sensors as sole authority):
+ *   Only the AGENT's file write is faked. The sensor runner (`runSensors`)
+ *   continues to execute `node check.js` for real, against the real file
+ *   system. The harness learns the task passed because the sensor command
+ *   actually exits 0 — not because the fake agent claims success.
+ */
+function makeFakeAgentQueryFn(): QueryFn {
+  return function (
+    params: Parameters<QueryFn>[0],
+  ): AsyncGenerator<SdkStreamMessage, void> {
+    // Detect repair context: loop-controller.ts's buildRepairPrompt always
+    // starts with this exact prefix when feeding sensor failure output back.
+    const prompt =
+      typeof params.prompt === "string" ? params.prompt : "";
+    const isRepairAttempt = prompt.includes(
+      "The following verification commands failed",
+    );
+
+    // Resolve the target repo path from the cwd option (mirrors how the real
+    // SDK receives it — see the `options: { cwd: task.targetRepoPath }` call
+    // in runAgentAttempt below).
+    const cwd = params.options?.cwd;
+
+    if (typeof cwd === "string") {
+      const answerPath = path.join(cwd, "answer.txt");
+      if (isRepairAttempt) {
+        // Repair attempt: write the correct value so check.js passes.
+        fs.writeFileSync(answerPath, "42", "utf8");
+      } else {
+        // First attempt: write a wrong value — check.js still fails,
+        // ensuring the retry + repair-prompt path is genuinely exercised.
+        fs.writeFileSync(answerPath, "0", "utf8");
+      }
+    }
+
+    // Return a minimal AsyncGenerator that yields one success result message.
+    // We use the explicit iterator protocol (rather than `async function*`) to
+    // avoid potential @typescript-eslint/require-await issues on a generator
+    // body that has no `await` expression.
+    const messages: SdkStreamMessage[] = [
+      {
+        type: "result",
+        subtype: "success",
+        result: isRepairAttempt
+          ? "fake agent: wrote correct value (repair attempt)"
+          : "fake agent: wrote wrong value (first attempt)",
+      },
+    ];
+    let idx = 0;
+
+    const iterator: AsyncGenerator<SdkStreamMessage, void> = {
+      next(): Promise<IteratorResult<SdkStreamMessage, void>> {
+        return Promise.resolve(
+          idx < messages.length
+            ? { done: false, value: messages[idx++] as SdkStreamMessage }
+            : { done: true, value: undefined },
+        );
+      },
+      return(): Promise<IteratorResult<SdkStreamMessage, void>> {
+        return Promise.resolve({ done: true, value: undefined });
+      },
+      throw(err?: unknown): Promise<IteratorResult<SdkStreamMessage, void>> {
+        const error =
+          err instanceof Error ? err : new Error("unknown iterator throw");
+        return Promise.reject(error);
+      },
+      [Symbol.asyncIterator](): AsyncGenerator<SdkStreamMessage, void> {
+        return this;
+      },
+    };
+
+    return iterator;
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
@@ -148,11 +258,23 @@ export async function runAgentAttempt(
   },
 ): Promise<AgentAttemptResult> {
   const timeoutMs = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+
+  // Resolve the QueryFn to use for this attempt (precedence, highest first):
+  //   1. Explicit `opts.queryFn` injection — used by all existing unit tests.
+  //   2. HARNESS_FAKE_AGENT env var (TEST-ONLY) — used by the e2e smoke test
+  //      to exercise the full CLI pipeline without real Anthropic API calls.
+  //      See `makeFakeAgentQueryFn` above for full documentation.
+  //   3. The real Claude Agent SDK `query()` — the production default.
+  //
   // Cast through unknown to bridge sdkQuery (returns Query<SDKMessage>) to
   // QueryFn (returns AsyncGenerator<SdkStreamMessage>). Every SDKMessage is
   // structurally compatible with SdkStreamMessage, so this is runtime-correct.
   const queryFn: QueryFn =
-    opts?.queryFn ?? (sdkQuery as unknown as QueryFn);
+    opts?.queryFn !== undefined
+      ? opts.queryFn
+      : process.env["HARNESS_FAKE_AGENT"] !== undefined
+        ? makeFakeAgentQueryFn()
+        : (sdkQuery as unknown as QueryFn);
 
   // Build the prompt — include repair context from the previous attempt when
   // the loop controller (Task 1.5) provides it.
