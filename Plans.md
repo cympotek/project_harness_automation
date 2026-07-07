@@ -39,15 +39,46 @@ formatter_baseline_action: add_setup_task (see 1.1)
   work against the real Anthropic API in CI" question rather than blocking the walking
   skeleton on it.
 
-## Phase 2 (Recommended, not started): beyond the walking skeleton
+## Phase 2: Claude Code (+ Codex, best-effort) Plugin Packaging
+
+Purpose: replace the standalone CLI entrypoint with an MCP-server-backed plugin so
+another project can install this harness by dropping a folder into
+`~/.claude/skills/` (Claude Code) or a Codex plugins marketplace entry, and invoke it
+in plain language instead of remembering CLI flags. Design doc:
+[`docs/superpowers/specs/2026-07-07-harness-claude-code-plugin-design.md`](docs/superpowers/specs/2026-07-07-harness-claude-code-plugin-design.md).
+
+Decisions locked in during brainstorming (see design doc for full rationale):
+- CLI (`cli.ts`, the `harness` bin) is retired, not kept alongside the plugin.
+- Both `repo` and `verify` commands are auto-detected by default (host project dir;
+  `package.json` scripts), with explicit override still possible — this resolves
+  spec.md Open Decisions #1 and #4.
+- Progress is streamed via MCP `notifications/progress`, not a single blocking call.
+- Codex support ships best-effort, using the real manifest schema from
+  `developers.openai.com/codex/plugins/build` (`.codex-plugin/plugin.json`), reusing
+  the same `.mcp.json` and `skills/harness-run/SKILL.md` built for Claude Code.
+
+| Task | Description | DoD | Depends | Status |
+|------|------|-----|---------|--------|
+| 2.1 | [setup] Add `@modelcontextprotocol/sdk` dependency; scaffold `src/mcp-server.ts` as a stdio MCP server entrypoint with zero tools registered yet. Update `package.json` (drop `harness` bin / commander dependency in prep for 2.7). | `npm run build` succeeds; `node dist/mcp-server.js` starts and exits cleanly on stdin close. | Phase 1 | cc:TODO |
+| 2.2 | [tdd:required] `src/verify-detect.ts`: given a repo path, read `package.json`, detect `scripts.lint` / `scripts.typecheck` (or `type-check`) / `scripts.test`, return the present ones as `["npm run <name>", ...]` in that order. | Unit tests over fixture `package.json` variants: all three scripts present, partial, none present, malformed JSON. | 2.1 | cc:TODO |
+| 2.3 | [tdd:required] `src/repo-detect.ts`: resolve the target repo path — explicit input wins; else MCP `roots/list`; else `CLAUDE_PROJECT_DIR` env; else a clear validation error (never silently defaults to cwd). | Unit test each fallback branch independently with mocked inputs, plus the no-resolution error case. | 2.1 | cc:TODO |
+| 2.4 | [tdd:required] [feature:security] Wire the `harness_run` MCP tool in `mcp-server.ts`: input schema `{ description (required), taskId?, repo?, verify?, maxAttempts? }`; merges auto-detected repo/verify (2.2, 2.3) with explicit overrides; extends `schema.ts` validation to reject an empty, fully-unresolved verify list (closes spec.md Open Decision #4); calls the existing `runTaskToCompletion()`. | Integration test with a mock MCP client calling the tool against a fixture repo; a repo path outside `ALLOWED_ROOTS` is still rejected before any agent/sensor runs (Core Rule 6 unchanged). | 2.2, 2.3 | cc:TODO |
+| 2.5 | [tdd:required] Wire loop-controller's per-attempt transitions (attempt started → verifying → result) to MCP `notifications/progress` messages. | Test driving a fixture task that fails twice then passes captures the expected ordered sequence of progress notifications via a mock transport. | 2.4 | cc:TODO |
+| 2.6 | [tdd:required] [e2e] End-to-end smoke test through the MCP entrypoint (mirrors `e2e.test.ts` from Phase 1, but drives it via an in-process MCP tool call instead of spawning the CLI): fixture repo with one intentionally failing test, no explicit `repo`/`verify` given, confirms auto-detection + retry-to-success within cap. | `npm test` includes this case and it passes. | 2.4, 2.5 | cc:TODO |
+| 2.7 | [cleanup] Retire the CLI: delete `src/cli.ts` and `src/cli.test.ts`; remove `commander` from `package.json` dependencies; update spec.md (Core Rule 8's entrypoint reference, Data And Contracts auto-detect defaults, resolve Open Decisions #1 and #4 explicitly, add a Core Rule documenting the MCP entrypoint + progress-notification behavior). | `npm run build` / `npm run lint` / `npm test` all pass with zero references to the deleted CLI; spec.md reflects the new contract. | 2.6 | cc:TODO |
+| 2.8 | [setup] Claude Code plugin packaging: `.claude-plugin/plugin.json`, `.mcp.json` (`command: node`, `args: ["${CLAUDE_PLUGIN_ROOT}/dist/mcp-server.js"]`), `skills/harness-run/SKILL.md` (documents `/harness-run`, auto-detected defaults, override syntax), `hooks/hooks.json` (`SessionStart` hook installing deps into `${CLAUDE_PLUGIN_DATA}` on first load / on `package.json` change). | Structural check against the Claude Code plugin docs (`.claude-plugin/` contains only `plugin.json`; all other dirs at plugin root); `claude plugin validate .` passes if available in this environment. | 2.7 | cc:TODO |
+| 2.9 | [setup] [experimental] Codex plugin packaging (best-effort): `.codex-plugin/plugin.json` (required: `name`, `version`, `description`; optional: `skills`, `mcpServers` paths pointing at the same `.mcp.json` / `skills/harness-run/SKILL.md` from 2.8). Flag explicitly as unverified against a live Codex install. | Manifest fields match the documented schema exactly; spec.md notes Codex support as experimental pending live validation. | 2.8 | cc:TODO |
+| 2.10 | [docs] Split README into `README.md` (English) and `README.zh-Hant.md` (繁體中文), replacing the retired-CLI install/usage instructions with the real plugin flow: skills-dir drop-in steps for Claude Code, best-effort steps for Codex, `/harness-run` usage, auto-detect behavior + override syntax, unchanged state/escalation-file behavior. | Both files reviewed against the actually-implemented plugin — zero remaining references to `npm link` / `harness run --task ...` CLI syntax. | 2.9 | cc:TODO |
+
+## Phase 3 (Recommended, not started): beyond the walking skeleton
 
 Purpose: extend the walking skeleton toward the fuller harness vision (multi-agent separation, skill ecosystem compatibility) once Phase 1 is proven.
 
 | Task | Description | DoD | Depends | Status |
 |------|------|-----|---------|--------|
-| 2.1 | Separate Evaluator agent (Generator/Evaluator split) so a distinct agent — not just computational sensors — judges "is this actually done" for cases sensors can't fully capture. | Design spike report: feasible / not feasible / needs-redesign, with a concrete evaluator-agent contract proposal. | Phase 1 | cc:TODO |
-| 2.2 | SKILL.md-compatible skill loading: harness can load local skills following the Anthropic SKILL.md convention (frontmatter + progressive disclosure) as additional "guides" for the agent. | A sample local skill folder is loaded and its instructions are demonstrably injected into an agent run's guides. | Phase 1 | cc:TODO |
-| 2.3 | Token/cost budget ceiling (Open Decision from spec.md) alongside the existing attempt-count cap. | A run configured with a cost ceiling stops and escalates when the ceiling is hit, even if `maxAttempts` has not been reached. | Phase 1 | cc:TODO |
+| 3.1 | Separate Evaluator agent (Generator/Evaluator split) so a distinct agent — not just computational sensors — judges "is this actually done" for cases sensors can't fully capture. | Design spike report: feasible / not feasible / needs-redesign, with a concrete evaluator-agent contract proposal. | Phase 1 | cc:TODO |
+| 3.2 | SKILL.md-compatible skill loading: harness can load local skills following the Anthropic SKILL.md convention (frontmatter + progressive disclosure) as additional "guides" for the agent. | A sample local skill folder is loaded and its instructions are demonstrably injected into an agent run's guides. | Phase 1 | cc:TODO |
+| 3.3 | Token/cost budget ceiling (Open Decision from spec.md) alongside the existing attempt-count cap. | A run configured with a cost ceiling stops and escalates when the ceiling is hit, even if `maxAttempts` has not been reached. | Phase 1 | cc:TODO |
 
 ---
 

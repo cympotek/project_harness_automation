@@ -111,14 +111,27 @@ plugin docs for this exact scenario).
 Because it has `.claude-plugin/plugin.json`, Claude Code auto-loads it as a plugin next
 session — no marketplace, no `claude plugin install` step.
 
-### Codex packaging (best-effort / explicitly experimental)
+### Codex packaging (best-effort, now with a concrete schema to build against)
 
-Same `dist/mcp-server.js`, registered via a Codex-specific plugin manifest as its
-MCP-server component (Codex's docs confirm plugins bundle MCP servers as one of three
-component types, but don't give a concrete manifest schema to build against with
-confidence). Ships marked experimental; the implementation plan should call out that
-this needs live validation against a real Codex install and may need rework once Codex
-publishes clearer plugin docs.
+Per `developers.openai.com/codex/plugins/build`, Codex plugins use their own manifest,
+distinct from Claude Code's:
+
+```
+.codex-plugin/plugin.json     # required fields: name, version, description
+                               # optional: skills, mcpServers, apps, hooks (paths)
+.mcp.json                     # same server-map shape as Claude Code's:
+                               #   { "harness": { "command": "...", "args": [...] } }
+skills/harness-run/SKILL.md   # same SKILL.md shape (frontmatter: name, description)
+```
+
+Reuses the exact same `dist/mcp-server.js` built for Claude Code — only the manifest
+wrapper differs (`.codex-plugin/plugin.json` instead of `.claude-plugin/plugin.json`).
+Local dev/testing needs a marketplace entry at `.agents/plugins/marketplace.json` (repo
+root or `~/.agents/plugins/`) with a relative `source.path`, then a Codex restart to
+load it — there's no zero-config "skills-dir" equivalent documented for Codex the way
+Claude Code has one, so this path is one step heavier to install than the Claude Code
+one. Still marked best-effort since it hasn't been validated against a live Codex
+install yet, but the manifest shape itself is no longer a guess.
 
 ## Data flow
 
