@@ -9,6 +9,12 @@ dist/
 .harness/escalations/
 .harness/
 
+# harness-work skill runtime/session state (local, ephemeral)
+.claude/state/
+.claude/sessions/
+.claude/memory/
+out/
+
 # OS & editor
 .DS_Store
 *.swp
